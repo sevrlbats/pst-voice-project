@@ -151,6 +151,24 @@ AREA_ORDER = [
     # --- Unmapped raw area codes & system (end of list) ---
 ]
 
+# Companion DLG files that belong to a specific area rather than "Any Area"
+COMPANION_DLG_AREA = {
+    "DMORTE1": "Mortuary",
+    "DMORTE2": "Mortuary",
+    "DANNAHF": "Fortress of Regrets",
+    "DGRACEF": "Fortress of Regrets",
+}
+
+
+def _reclassify_companion_dlgs(rows: list[dict]):
+    """Move area-specific companion dialogues out of the catch-all bucket."""
+    for r in rows:
+        if r["area"] == "Companion Dialog (Any Area)":
+            new_area = COMPANION_DLG_AREA.get(r["dlg_file"])
+            if new_area:
+                r["area"] = new_area
+
+
 def _build_area_key(areas_in_data: set[str]) -> list[str]:
     """Return areas in game order. Any areas in the data not listed in
     AREA_ORDER are appended alphabetically at the end."""
@@ -386,6 +404,14 @@ class VoiceBooth(tk.Tk):
             command=self._play, **btn_style)
         self.btn_play.pack(side="right")
 
+        self.instant_rec_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            transport, text="Instant rec", variable=self.instant_rec_var,
+            font=("Segoe UI", 8),
+            bg=BG, fg=FG_DIM, selectcolor=BG_MID,
+            activebackground=BG, activeforeground=FG
+        ).pack(side="right", padx=(0, 6))
+
         # --- Filter row ---
         filt = tk.Frame(self, bg=BG)
         filt.pack(fill="x", padx=10, pady=(2, 2))
@@ -415,14 +441,6 @@ class VoiceBooth(tk.Tk):
             bg=BG, fg=FG_DIM, selectcolor=BG_MID,
             activebackground=BG, activeforeground=FG
         ).pack(side="right")
-
-        self.instant_rec_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
-            filt, text="Instant record", variable=self.instant_rec_var,
-            font=("Segoe UI", 8),
-            bg=BG, fg=FG_DIM, selectcolor=BG_MID,
-            activebackground=BG, activeforeground=FG
-        ).pack(side="right", padx=(0, 6))
 
         # --- Progress bar ---
         prog = tk.Frame(self, bg=BG)
@@ -777,6 +795,7 @@ def main():
         sys.exit(1)
 
     rows = load_csv(CSV_PATH)
+    _reclassify_companion_dlgs(rows)
     print(f"Loaded {len(rows):,} unvoiced lines from {CSV_PATH.name}")
 
     OUTPUT_DIR.mkdir(exist_ok=True)
