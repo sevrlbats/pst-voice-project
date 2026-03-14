@@ -1,0 +1,14 @@
+============================================================
+  PLANESCAPE: TORMENT — VOICE MOD CREDITS
+============================================================
+
+This mod adds voiceover to previously unvoiced dialogue
+in Planescape: Torment. The following voice actors
+generously contributed their talents:
+
+  sevrL_bats
+    as Ei-Vene, Morte, Soego
+
+  Total lines voiced: 6
+
+============================================================
