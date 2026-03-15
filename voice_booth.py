@@ -13,12 +13,15 @@ Keyboard shortcuts:
 """
 
 import csv
+import json
 import os
+import shutil
 import sys
 import time
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -41,8 +44,8 @@ CSV_FIELDS   = ["area", "dlg_file", "character", "line_type",
                 "conv_position", "strref", "voice_file", "voice_actor", "text"]
 
 # UI sizing
-WIN_WIDTH    = 520
-WIN_HEIGHT   = 500
+WIN_WIDTH    = 580
+WIN_HEIGHT   = 700
 TEXT_HEIGHT  = 7       # lines visible in text box
 
 # Colors
@@ -197,16 +200,170 @@ def save_csv(path: Path, rows: list[dict]):
         writer.writerows(rows)
 
 
-def load_voice_name(path: Path) -> str:
-    """Load the last-used voice actor name from config."""
+def load_config(path: Path) -> dict:
+    """Load config (JSON). Falls back to old plain-text voice-name format."""
     try:
-        return path.read_text(encoding="utf-8").strip()
+        text = path.read_text(encoding="utf-8").strip()
+        if text.startswith("{"):
+            return json.loads(text)
+        return {"voice_name": text}  # backward compat
     except FileNotFoundError:
-        return ""
+        return {}
 
 
-def save_voice_name(path: Path, name: str):
-    path.write_text(name.strip(), encoding="utf-8")
+def save_config(path: Path, cfg: dict):
+    path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+
+
+def get_input_devices() -> list[tuple[int, str]]:
+    """Return (index, name) for each input-capable audio device."""
+    result = []
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0:
+            result.append((i, d["name"]))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Audio post-processing
+# ---------------------------------------------------------------------------
+def apply_noise_gate(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Silence low-level segments (breaths, ambient noise) between speech.
+
+    Adaptive threshold set -30 dB below the peak RMS, with a 150 ms hold
+    time to avoid chopping word tails and a 30 ms look-ahead so consonant
+    onsets aren't clipped.  Gate boundaries get a 5 ms crossfade.
+    """
+    WINDOW_MS  = 20      # analysis window length
+    THRESH_DB  = -30     # dB below peak RMS
+    HOLD_MS    = 150     # keep gate open after last loud frame
+    ATTACK_MS  = 30      # open gate this far before speech onset
+    FADE_MS    = 5       # crossfade at open / close boundaries
+
+    orig_shape = audio.shape
+    audio = audio.ravel()                    # flatten to 1-D
+
+    win = int(sample_rate * WINDOW_MS / 1000)
+    n_frames = len(audio) // win
+    if n_frames < 3:
+        return audio.reshape(orig_shape)
+
+    af = audio.astype(np.float64)
+
+    # RMS per analysis window
+    rms = np.array([
+        np.sqrt(np.mean(af[i * win:(i + 1) * win] ** 2))
+        for i in range(n_frames)
+    ])
+
+    peak = np.max(rms)
+    if peak < 1.0:
+        return audio.reshape(orig_shape)  # entire clip is silence
+
+    thresh = peak * 10 ** (THRESH_DB / 20.0)
+
+    # --- gate open / closed per frame ---
+    gate = rms >= thresh
+
+    # Hold: keep open for HOLD_MS after last above-threshold frame
+    hold_n = max(1, int(HOLD_MS / WINDOW_MS))
+    held = gate.copy()
+    countdown = 0
+    for i in range(n_frames):
+        if gate[i]:
+            countdown = hold_n
+        elif countdown > 0:
+            held[i] = True
+            countdown -= 1
+
+    # Attack look-back: open gate a few frames before each speech onset
+    attack_n = max(1, int(ATTACK_MS / WINDOW_MS))
+    for i in range(1, n_frames):
+        if held[i] and not held[i - 1]:
+            for j in range(max(0, i - attack_n), i):
+                held[j] = True
+
+    # --- apply gate with crossfades ---
+    fade_n = max(1, int(sample_rate * FADE_MS / 1000))
+    result = audio.copy()
+
+    for i in range(n_frames):
+        if not held[i]:
+            s = i * win
+            e = min(s + win, len(result))
+            result[s:e] = 0
+
+    # smooth open/close boundaries
+    for i in range(1, n_frames):
+        boundary = i * win
+        if held[i] == held[i - 1]:
+            continue
+        fn = min(fade_n, boundary, len(result) - boundary)
+        if fn <= 0:
+            continue
+        if held[i]:                                  # gate opening
+            ramp = np.linspace(0.0, 1.0, fn)
+            result[boundary:boundary + fn] = (
+                audio[boundary:boundary + fn].astype(np.float64) * ramp
+            ).astype(audio.dtype)
+        else:                                        # gate closing
+            ramp = np.linspace(1.0, 0.0, fn)
+            result[boundary - fn:boundary] = (
+                audio[boundary - fn:boundary].astype(np.float64) * ramp
+            ).astype(audio.dtype)
+
+    return result.reshape(orig_shape)
+
+
+def trim_tail_click(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Detect and remove a keypress / mouse-click transient in the last 0.5 s.
+
+    Scans the tail of the recording in 5 ms windows.  If a window's peak
+    amplitude exceeds the local median by 6 ×, everything from that point
+    onward is trimmed and a 10 ms fade-out is applied.
+    """
+    SEARCH_MS = 500
+    RATIO     = 6.0       # click must be this much louder than the local level
+    FADE_MS   = 10
+
+    orig_shape = audio.shape
+    audio = audio.ravel()                            # flatten to 1-D
+
+    search_n = int(sample_rate * SEARCH_MS / 1000)
+    if len(audio) < search_n * 2:
+        return audio.reshape(orig_shape)             # too short to trim safely
+
+    tail = np.abs(audio[-search_n:].astype(np.float64))
+
+    # 5 ms peak-amplitude windows
+    win = max(1, int(sample_rate * 0.005))
+    n = len(tail) // win
+    if n < 4:
+        return audio.reshape(orig_shape)
+
+    peaks = np.array([np.max(tail[i * win:(i + 1) * win]) for i in range(n)])
+
+    # Reference level: median of first half of search region (speech tail)
+    ref = float(np.median(peaks[: n // 2]))
+    if ref < 100:
+        ref = 100.0                                  # floor for very quiet tails
+
+    # Scan backwards for a transient
+    for i in range(n - 1, n // 2, -1):
+        if peaks[i] > ref * RATIO:
+            onset = max(0, i - 2)                    # back up a couple of windows
+            cut = len(audio) - search_n + onset * win
+            trimmed = audio[:cut].copy()
+            # apply fade-out
+            fade_n = min(int(sample_rate * FADE_MS / 1000), len(trimmed))
+            if fade_n > 0:
+                ramp = np.linspace(1.0, 0.0, fade_n)
+                trimmed[-fade_n:] = (
+                    trimmed[-fade_n:].astype(np.float64) * ramp
+                ).astype(audio.dtype)
+            return trimmed.reshape(-1, *orig_shape[1:])
+
+    return audio.reshape(orig_shape)                 # no click detected
 
 
 def generate_credits(rows: list[dict], path: Path):
@@ -261,11 +418,20 @@ class VoiceBooth(tk.Tk):
         self.filtered_rows = list(rows)
         self.idx = 0
 
+        # Config
+        self.cfg = load_config(CONFIG_PATH)
+
+        # Audio devices
+        self.input_devices = get_input_devices()  # [(index, name), ...]
+
         # Recording state
         self.is_recording = False
+        self.is_paused = False
         self.rec_frames: list[np.ndarray] = []
         self.rec_stream = None
         self.rec_start_time = 0.0
+        self.rec_pause_start = 0.0       # when current pause began
+        self.rec_paused_total = 0.0      # accumulated paused seconds
         self.timer_id = None
 
         # Playback state
@@ -282,9 +448,26 @@ class VoiceBooth(tk.Tk):
         for k in self.area_characters:
             self.area_characters[k] = sorted(self.area_characters[k])
         self.all_characters = sorted({r["character"] for r in rows})
+        self.all_dlg_files = sorted({r["dlg_file"] for r in rows})
+
+        # Conversation order: dlg_file -> rows sorted by conv_position
+        self.dlg_conv_order: dict[str, list[dict]] = {}
+        for r in rows:
+            self.dlg_conv_order.setdefault(r["dlg_file"], []).append(r)
+        for k in self.dlg_conv_order:
+            self.dlg_conv_order[k].sort(
+                key=lambda r: int(r.get("conv_position", 0)))
+
+        # Duplicate-text index: text -> list of rows (only for duplicated lines)
+        _text_groups: dict[str, list[dict]] = defaultdict(list)
+        for r in rows:
+            _text_groups[r["text"]].append(r)
+        self.text_duplicates = {t: rs for t, rs in _text_groups.items()
+                                if len(rs) > 1}
 
         self._build_ui()
         self._bind_keys()
+        self._update_line_browser()
         self._update_display()
         self._update_progress()
 
@@ -321,15 +504,36 @@ class VoiceBooth(tk.Tk):
         tk.Label(voice_row, text="Voice:", font=("Segoe UI", 9, "bold"),
                  bg=BG, fg=FG_DIM).pack(side="left")
 
-        self.voice_var = tk.StringVar(value=load_voice_name(CONFIG_PATH))
+        self.voice_var = tk.StringVar(value=self.cfg.get("voice_name", ""))
         self.voice_entry = tk.Entry(
             voice_row, textvariable=self.voice_var, font=("Segoe UI", 10),
             bg=BG_MID, fg=GOLD, insertbackground=GOLD, relief="flat",
             width=30)
         self.voice_entry.pack(side="left", padx=(6, 0), ipady=2)
         # Save name whenever it changes
-        self.voice_var.trace_add("write", lambda *_: save_voice_name(
-            CONFIG_PATH, self.voice_var.get()))
+        self.voice_var.trace_add("write", lambda *_: self._save_cfg())
+
+        # --- Input device selector ---
+        dev_row = tk.Frame(self, bg=BG)
+        dev_row.pack(fill="x", padx=10, pady=(2, 2))
+
+        tk.Label(dev_row, text="Mic:", font=("Segoe UI", 9, "bold"),
+                 bg=BG, fg=FG_DIM).pack(side="left")
+
+        device_names = [name for _, name in self.input_devices]
+        self.dev_var = tk.StringVar()
+        self.dev_cb = ttk.Combobox(dev_row, textvariable=self.dev_var,
+                                   values=device_names, state="readonly",
+                                   width=45)
+        self.dev_cb.pack(side="left", padx=(6, 0))
+        self.dev_cb.bind("<<ComboboxSelected>>", lambda e: self._save_cfg())
+
+        # Restore saved device or fall back to system default
+        saved_dev = self.cfg.get("input_device", "")
+        if saved_dev in device_names:
+            self.dev_var.set(saved_dev)
+        elif device_names:
+            self.dev_var.set(device_names[0])
 
         # --- Info bar: area | character | type ---
         info = tk.Frame(self, bg=BG_MID)
@@ -347,15 +551,27 @@ class VoiceBooth(tk.Tk):
                                  bg=BG_MID, fg=FG_DIM, anchor="e")
         self.lbl_type.pack(side="right", padx=6)
 
+        # --- Context: previous line ---
+        self.lbl_ctx_prev = tk.Label(
+            self, text="", font=("Segoe UI", 8), bg=BG, fg=FG_DIM,
+            anchor="w", wraplength=WIN_WIDTH - 30)
+        self.lbl_ctx_prev.pack(fill="x", padx=14, pady=(2, 0))
+
         # --- Text display ---
         txt_frame = tk.Frame(self, bg=BG_DARK, bd=1, relief="solid")
-        txt_frame.pack(fill="both", expand=True, padx=10, pady=4)
+        txt_frame.pack(fill="both", expand=True, padx=10, pady=2)
 
         self.txt = tk.Text(
             txt_frame, wrap="word", font=("Georgia", 11), height=TEXT_HEIGHT,
             bg=BG_DARK, fg=FG, insertbackground=FG, relief="flat",
             padx=10, pady=8, state="disabled", cursor="arrow")
         self.txt.pack(fill="both", expand=True)
+
+        # --- Context: next line ---
+        self.lbl_ctx_next = tk.Label(
+            self, text="", font=("Segoe UI", 8), bg=BG, fg=FG_DIM,
+            anchor="w", wraplength=WIN_WIDTH - 30)
+        self.lbl_ctx_next.pack(fill="x", padx=14, pady=(0, 2))
 
         # --- Strref + timer row ---
         meta = tk.Frame(self, bg=BG)
@@ -412,6 +628,28 @@ class VoiceBooth(tk.Tk):
             activebackground=BG, activeforeground=FG
         ).pack(side="right", padx=(0, 6))
 
+        # --- Processing options ---
+        proc = tk.Frame(self, bg=BG)
+        proc.pack(fill="x", padx=10, pady=(0, 2))
+
+        _cb = dict(font=("Segoe UI", 8), bg=BG, fg=FG_DIM,
+                   selectcolor=BG_MID, activebackground=BG,
+                   activeforeground=FG)
+
+        self.gate_var = tk.BooleanVar(
+            value=self.cfg.get("noise_gate", True))
+        tk.Checkbutton(
+            proc, text="Noise gate", variable=self.gate_var,
+            command=self._save_cfg, **_cb
+        ).pack(side="left")
+
+        self.trim_var = tk.BooleanVar(
+            value=self.cfg.get("trim_click", True))
+        tk.Checkbutton(
+            proc, text="Trim click", variable=self.trim_var,
+            command=self._save_cfg, **_cb
+        ).pack(side="left", padx=(8, 0))
+
         # --- Filter row ---
         filt = tk.Frame(self, bg=BG)
         filt.pack(fill="x", padx=10, pady=(2, 2))
@@ -431,16 +669,63 @@ class VoiceBooth(tk.Tk):
                                     values=["All Characters"] + self.all_characters,
                                     state="readonly")
         self.char_cb.pack(side="left", padx=(0, 6))
-        self.char_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_filter())
+        self.char_cb.bind("<<ComboboxSelected>>", lambda e: self._on_char_changed())
         self._bind_key_jump(self.char_cb)
 
-        self.unrecorded_var = tk.BooleanVar(value=False)
+        self.unrecorded_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
             filt, text="Unrecorded only", variable=self.unrecorded_var,
             command=self._apply_filter, font=("Segoe UI", 8),
             bg=BG, fg=FG_DIM, selectcolor=BG_MID,
             activebackground=BG, activeforeground=FG
         ).pack(side="right")
+
+        # --- Dialogue filter ---
+        dlg_row = tk.Frame(self, bg=BG)
+        dlg_row.pack(fill="x", padx=10, pady=(0, 2))
+
+        tk.Label(dlg_row, text="DLG:", font=("Segoe UI", 9),
+                 bg=BG, fg=FG_DIM).pack(side="left")
+
+        self.dlg_var = tk.StringVar(value="All Dialogues")
+        self.dlg_cb = ttk.Combobox(dlg_row, textvariable=self.dlg_var,
+                                   values=["All Dialogues"] + self.all_dlg_files,
+                                   state="readonly", width=52)
+        self.dlg_cb.pack(side="left", padx=(4, 0))
+        self.dlg_cb.bind("<<ComboboxSelected>>", lambda e: self._on_dlg_changed())
+        self._bind_key_jump(self.dlg_cb)
+
+        # --- Text search ---
+        search_row = tk.Frame(self, bg=BG)
+        search_row.pack(fill="x", padx=10, pady=(0, 2))
+
+        tk.Label(search_row, text="Find:", font=("Segoe UI", 9),
+                 bg=BG, fg=FG_DIM).pack(side="left")
+
+        self.search_var = tk.StringVar()
+        self.search_entry = tk.Entry(
+            search_row, textvariable=self.search_var, font=("Segoe UI", 9),
+            bg=BG_MID, fg=FG, insertbackground=FG, relief="flat", width=40)
+        self.search_entry.pack(side="left", padx=(4, 0), ipady=2)
+        self.search_var.trace_add("write", lambda *_: self._apply_filter())
+
+        self.lbl_search_count = tk.Label(
+            search_row, text="", font=("Segoe UI", 8),
+            bg=BG, fg=FG_DIM, anchor="w")
+        self.lbl_search_count.pack(side="left", padx=(6, 0))
+
+        # --- Line browser ---
+        line_row = tk.Frame(self, bg=BG)
+        line_row.pack(fill="x", padx=10, pady=(0, 2))
+
+        tk.Label(line_row, text="Line:", font=("Segoe UI", 9),
+                 bg=BG, fg=FG_DIM).pack(side="left")
+
+        self.line_var = tk.StringVar()
+        self.line_cb = ttk.Combobox(line_row, textvariable=self.line_var,
+                                    state="readonly", width=52)
+        self.line_cb.pack(side="left", padx=(4, 0))
+        self.line_cb.bind("<<ComboboxSelected>>", lambda e: self._on_line_selected())
 
         # --- Progress bar ---
         prog = tk.Frame(self, bg=BG)
@@ -461,7 +746,7 @@ class VoiceBooth(tk.Tk):
         # Guard: don't fire shortcuts while typing in the voice name field
         def _guard(action):
             def wrapper(event):
-                if event.widget is self.voice_entry:
+                if event.widget in (self.voice_entry, self.search_entry):
                     return  # let the Entry handle it normally
                 action()
                 return "break"
@@ -479,6 +764,8 @@ class VoiceBooth(tk.Tk):
         self.bind("p",        _guard(self._play))
         self.bind("P",        _guard(self._play))
         self.bind("<Escape>", lambda e: self._stop_playback())
+        self.bind("<Control_L>",  lambda e: self._toggle_pause())
+        self.bind("<Control_R>",  lambda e: self._toggle_pause())
 
     # -----------------------------------------------------------------------
     # Display
@@ -490,6 +777,28 @@ class VoiceBooth(tk.Tk):
 
     def _wav_path(self, row: dict) -> Path:
         return OUTPUT_DIR / f"{row['strref']}.wav"
+
+    def _get_context(self, row: dict) -> tuple[dict | None, dict | None]:
+        """Return (prev_line, next_line) from the same dialogue."""
+        conv = self.dlg_conv_order.get(row["dlg_file"], [])
+        strref = row["strref"]
+        idx = None
+        for i, r in enumerate(conv):
+            if r["strref"] == strref:
+                idx = i
+                break
+        if idx is None:
+            return None, None
+        prev_r = conv[idx - 1] if idx > 0 else None
+        next_r = conv[idx + 1] if idx < len(conv) - 1 else None
+        return prev_r, next_r
+
+    def _fmt_context(self, row: dict | None, arrow: str) -> str:
+        """Format a context line for display."""
+        if row is None:
+            return ""
+        text = row["text"].replace("\r", "").replace("\n", " ")[:65]
+        return f"{arrow} [{row['character']}]  {text}"
 
     def _update_display(self):
         row = self._cur()
@@ -503,12 +812,16 @@ class VoiceBooth(tk.Tk):
             self.lbl_strref.config(text="strref: —")
             self.lbl_recorded.config(text="")
             self.lbl_nav.config(text="0 / 0")
+            self.lbl_ctx_prev.config(text="")
+            self.lbl_ctx_next.config(text="")
             return
 
         self.lbl_area.config(text=row["area"])
         self.lbl_char.config(text=row["character"])
         self.lbl_type.config(text=row["line_type"])
-        self.lbl_strref.config(text=f"strref: {row['strref']}")
+        dupes = self.text_duplicates.get(row["text"], [])
+        dupe_tag = f"  (\u00d7{len(dupes)} identical)" if len(dupes) > 1 else ""
+        self.lbl_strref.config(text=f"strref: {row['strref']}{dupe_tag}")
 
         # Show text
         self.txt.config(state="normal")
@@ -529,6 +842,15 @@ class VoiceBooth(tk.Tk):
         # Nav counter
         self.lbl_nav.config(text=f"{self.idx + 1} / {len(self.filtered_rows)}")
 
+        # Sync line browser selection
+        if hasattr(self, "line_cb") and self.filtered_rows and self.line_cb.cget("values"):
+            self.line_cb.current(self.idx)
+
+        # Conversation context
+        prev_r, next_r = self._get_context(row)
+        self.lbl_ctx_prev.config(text=self._fmt_context(prev_r, "\u25b2"))
+        self.lbl_ctx_next.config(text=self._fmt_context(next_r, "\u25bc"))
+
     def _update_progress(self):
         total = len(self.all_rows)
         done = sum(1 for r in self.all_rows if self._wav_path(r).exists())
@@ -541,6 +863,7 @@ class VoiceBooth(tk.Tk):
     def _prev(self):
         if self.is_recording:
             if self.instant_rec_var.get():
+                self.is_paused = False
                 self._stop_record_internal()
             else:
                 return
@@ -553,6 +876,7 @@ class VoiceBooth(tk.Tk):
     def _next(self):
         if self.is_recording:
             if self.instant_rec_var.get():
+                self.is_paused = False
                 self._stop_record_internal()
             else:
                 return
@@ -566,8 +890,7 @@ class VoiceBooth(tk.Tk):
     # Filtering
     # -----------------------------------------------------------------------
     def _on_area_changed(self):
-        """When area filter changes, update character dropdown to show only
-        characters present in that area (cascading filter)."""
+        """When area filter changes, cascade: characters → dialogues → filter."""
         area = self.area_var.get()
         if area == "All Areas":
             chars = self.all_characters
@@ -580,7 +903,49 @@ class VoiceBooth(tk.Tk):
         if self.char_var.get() != "All Characters" and self.char_var.get() not in chars:
             self.char_var.set("All Characters")
 
+        self._on_char_changed()
+
+    def _on_char_changed(self):
+        """When character filter changes, cascade: dialogues → filter."""
+        self._update_dlg_dropdown()
         self._apply_filter()
+
+    def _on_dlg_changed(self):
+        """When dialogue filter changes, re-apply filter."""
+        self._apply_filter()
+
+    def _update_dlg_dropdown(self):
+        """Rebuild DLG dropdown from current area/character selection."""
+        area = self.area_var.get()
+        char = self.char_var.get()
+        dlgs = sorted({
+            r["dlg_file"] for r in self.all_rows
+            if (area == "All Areas" or r["area"] == area)
+            and (char == "All Characters" or r["character"] == char)
+        })
+        self.dlg_cb.config(values=["All Dialogues"] + dlgs)
+        if self.dlg_var.get() != "All Dialogues" and self.dlg_var.get() not in dlgs:
+            self.dlg_var.set("All Dialogues")
+
+    def _update_line_browser(self):
+        """Rebuild the line dropdown from current filtered_rows."""
+        previews = []
+        for r in self.filtered_rows:
+            mark = "\u2714" if self._wav_path(r).exists() else "  "
+            text = r["text"].replace("\r", "").replace("\n", " ")[:45]
+            previews.append(f"{mark} #{r['strref']}  {text}")
+        self.line_cb.config(values=previews)
+        if previews and self.idx < len(previews):
+            self.line_cb.current(self.idx)
+        elif not previews:
+            self.line_var.set("")
+
+    def _on_line_selected(self):
+        """Jump to the line chosen in the line browser."""
+        idx = self.line_cb.current()
+        if 0 <= idx < len(self.filtered_rows):
+            self.idx = idx
+            self._update_display()
 
     def _bind_key_jump(self, combobox: ttk.Combobox):
         """Bind key presses on a combobox so typing a letter jumps to the
@@ -610,16 +975,31 @@ class VoiceBooth(tk.Tk):
 
         area = self.area_var.get()
         char = self.char_var.get()
+        dlg  = self.dlg_var.get()
         unrecorded = self.unrecorded_var.get()
+        query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
 
         self.filtered_rows = [
             r for r in self.all_rows
             if (area == "All Areas" or r["area"] == area)
             and (char == "All Characters" or r["character"] == char)
+            and (dlg == "All Dialogues" or r["dlg_file"] == dlg)
             and (not unrecorded or not self._wav_path(r).exists())
+            and (not query or query in r["text"].lower()
+                 or query in r["character"].lower()
+                 or query in r.get("strref", ""))
         ]
         self.idx = 0
+        self._update_line_browser()
         self._update_display()
+
+        # Update search hit count
+        if hasattr(self, "lbl_search_count"):
+            if query:
+                self.lbl_search_count.config(
+                    text=f"{len(self.filtered_rows)} hits")
+            else:
+                self.lbl_search_count.config(text="")
 
     # -----------------------------------------------------------------------
     # Recording
@@ -638,7 +1018,10 @@ class VoiceBooth(tk.Tk):
 
         self.rec_frames = []
         self.is_recording = True
+        self.is_paused = False
         self.rec_start_time = time.time()
+        self.rec_pause_start = 0.0
+        self.rec_paused_total = 0.0
 
         self.btn_rec.config(text="\u23f9  Stop", bg="#c0392b")
         self.lbl_timer.config(text="\u25cf 0:00.0", fg=ACCENT)
@@ -648,7 +1031,7 @@ class VoiceBooth(tk.Tk):
             self.rec_stream = sd.InputStream(
                 samplerate=SAMPLE_RATE, channels=CHANNELS,
                 dtype="int16", callback=self._audio_callback,
-                blocksize=1024)
+                blocksize=1024, device=self._selected_device_index())
             self.rec_stream.start()
         except Exception as exc:
             messagebox.showerror("Audio Error", f"Could not open microphone:\n{exc}")
@@ -657,26 +1040,43 @@ class VoiceBooth(tk.Tk):
             self.lbl_timer.config(text="")
 
     def _audio_callback(self, indata, frames, time_info, status):
-        self.rec_frames.append(indata.copy())
+        if not self.is_paused:
+            self.rec_frames.append(indata.copy())
 
     def _tick_timer(self):
         if not self.is_recording:
             return
-        elapsed = time.time() - self.rec_start_time
+        if self.is_paused:
+            elapsed = self.rec_pause_start - self.rec_start_time - self.rec_paused_total
+        else:
+            elapsed = time.time() - self.rec_start_time - self.rec_paused_total
         mins = int(elapsed) // 60
         secs = elapsed % 60
-        self.lbl_timer.config(text=f"\u25cf {mins}:{secs:04.1f}")
+        if self.is_paused:
+            self.lbl_timer.config(text=f"\u23f8 {mins}:{secs:04.1f}", fg=GOLD)
+        else:
+            self.lbl_timer.config(text=f"\u25cf {mins}:{secs:04.1f}", fg=ACCENT)
         self.timer_id = self.after(100, self._tick_timer)
 
+    def _toggle_pause(self):
+        """Pause / unpause the current recording (Ctrl key)."""
+        if not self.is_recording:
+            return
+        if self.is_paused:
+            # Resume: accumulate how long this pause lasted
+            self.rec_paused_total += time.time() - self.rec_pause_start
+            self.is_paused = False
+            self.btn_rec.config(text="\u23f9  Stop", bg="#c0392b")
+        else:
+            # Pause: note the moment
+            self.rec_pause_start = time.time()
+            self.is_paused = True
+            self.btn_rec.config(text="\u23f8 Paused", bg=BG_DARK)
+
     def _stop_record(self):
-        """Stop recording and save. If instant record mode is on, auto-advance."""
+        """Stop recording and save."""
+        self.is_paused = False
         self._stop_record_internal()
-        # In instant record mode, stopping via Space/button auto-advances
-        if self.instant_rec_var.get():
-            if self.filtered_rows and self.idx < len(self.filtered_rows) - 1:
-                self.idx += 1
-                self._update_display()
-                self.after(50, self._start_record)
 
     def _stop_record_internal(self):
         """Stop recording and save the WAV file (no auto-advance)."""
@@ -707,6 +1107,13 @@ class VoiceBooth(tk.Tk):
 
         try:
             audio = np.concatenate(frames, axis=0)
+
+            # --- Post-processing ---
+            if self.trim_var.get():
+                audio = trim_tail_click(audio, SAMPLE_RATE)
+            if self.gate_var.get():
+                audio = apply_noise_gate(audio, SAMPLE_RATE)
+
             row = self._cur()
             OUTPUT_DIR.mkdir(exist_ok=True)
             path = self._wav_path(row)
@@ -718,6 +1125,20 @@ class VoiceBooth(tk.Tk):
             if actor:
                 row["voice_actor"] = actor
 
+            # Propagate to rows with identical text
+            dupe_count = 0
+            dupes = self.text_duplicates.get(row["text"], [])
+            for dupe_row in dupes:
+                if dupe_row is row:
+                    continue
+                if self._wav_path(dupe_row).exists():
+                    continue
+                shutil.copy2(str(path), str(self._wav_path(dupe_row)))
+                dupe_row["voice_file"] = f"{dupe_row['strref']}.wav"
+                if actor:
+                    dupe_row["voice_actor"] = actor
+                dupe_count += 1
+
             # Persist CSV and regenerate credits
             save_csv(CSV_PATH, self.all_rows)
             generate_credits(self.all_rows, CREDITS_PATH)
@@ -725,9 +1146,12 @@ class VoiceBooth(tk.Tk):
             elapsed = time.time() - self.rec_start_time
             mins = int(elapsed) // 60
             secs = elapsed % 60
-            self.lbl_timer.config(text=f"\u2714 {mins}:{secs:04.1f}", fg=GREEN)
+            dupe_tag = f"  (+{dupe_count} dupes)" if dupe_count else ""
+            self.lbl_timer.config(
+                text=f"\u2714 {mins}:{secs:04.1f}{dupe_tag}", fg=GREEN)
             self._update_display()
             self._update_progress()
+            self._update_line_browser()
 
         except Exception as exc:
             self.lbl_timer.config(text=f"\u2716 save failed", fg=ACCENT)
@@ -777,6 +1201,21 @@ class VoiceBooth(tk.Tk):
     # -----------------------------------------------------------------------
     def _toggle_pin(self):
         self.attributes("-topmost", self.pin_var.get())
+
+    def _save_cfg(self):
+        self.cfg["voice_name"] = self.voice_var.get().strip()
+        self.cfg["input_device"] = self.dev_var.get()
+        self.cfg["noise_gate"] = self.gate_var.get()
+        self.cfg["trim_click"] = self.trim_var.get()
+        save_config(CONFIG_PATH, self.cfg)
+
+    def _selected_device_index(self) -> int | None:
+        """Return the sounddevice index for the currently selected mic."""
+        name = self.dev_var.get()
+        for idx, n in self.input_devices:
+            if n == name:
+                return idx
+        return None
 
     def _on_close(self):
         if self.is_recording:

@@ -15,6 +15,9 @@ import shutil
 import sys
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -28,6 +31,9 @@ CREDITS_SRC   = RECORDINGS / "CREDITS.txt"
 MOD_DIR       = GAME_DIR / "PST_Voice_Mod"
 MOD_AUDIO     = MOD_DIR / "audio"
 TP2_PATH      = GAME_DIR / "setup-PST_Voice_Mod.tp2"
+
+# Volume boost applied at build time (original recordings are untouched)
+GAIN          = 9.0
 
 
 def main():
@@ -78,12 +84,18 @@ def main():
     # 3. Copy WAV files from voice_recordings/ into mod audio folder
     # ------------------------------------------------------------------
     copied = 0
+    clipped = 0
     missing = []
     for e in entries:
         src = RECORDINGS / e["wav_name"]
         dst = MOD_AUDIO / f"{e['resref']}.wav"
         if src.exists():
-            shutil.copy2(src, dst)
+            data, sr = sf.read(str(src), dtype="int16")
+            boosted = data.astype(np.float64) * GAIN
+            boosted = np.clip(boosted, -32768, 32767).astype(np.int16)
+            if np.any(np.abs(data.astype(np.float64) * GAIN) > 32767):
+                clipped += 1
+            sf.write(str(dst), boosted, sr, subtype="PCM_16")
             copied += 1
         else:
             missing.append(f"  {e['wav_name']} (strref {e['strref']}, {e['char']})")
@@ -96,7 +108,9 @@ def main():
             print(f"  ... and {len(missing) - 20} more")
         print()
 
-    print(f"Copied {copied} audio files to {MOD_AUDIO}")
+    print(f"Copied {copied} audio files to {MOD_AUDIO} (gain: {GAIN}x)")
+    if clipped:
+        print(f"  Note: {clipped} file(s) had peaks clipped at {GAIN}x gain")
 
     # ------------------------------------------------------------------
     # 4. Generate self-contained .tp2
@@ -124,7 +138,7 @@ def main():
     tp2_lines.append(f"  // Patch dialog.tlk: add sound resrefs for {len(entries)} strings")
 
     for e in entries:
-        safe = e["preview"].replace("*/", "* /").replace("~", "")
+        safe = e["preview"].replace("\r", "").replace("\n", " ").replace("*/", "* /").replace("~", "")
         resref = e["resref"].upper()
         tp2_lines.append(f"")
         tp2_lines.append(f"  // strref {e['strref']}: {e['char']} - {safe}")

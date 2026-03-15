@@ -7,8 +7,9 @@ in Planescape: Torment. The following voice actors
 generously contributed their talents:
 
   sevrL_bats
-    as Ei-Vene, Morte, Soego
+    as Dhall, Ei-Vene, Giant Skeleton
+       Morte, Soego
 
-  Total lines voiced: 6
+  Total lines voiced: 494
 
 ============================================================
