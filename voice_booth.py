@@ -467,8 +467,18 @@ class VoiceBooth(tk.Tk):
 
         self._build_ui()
         self._bind_keys()
-        self._update_line_browser()
-        self._update_display()
+        self._rebuild_area_dropdown()
+        self._rebuild_char_dropdown()
+        self._update_dlg_dropdown()
+        self._apply_filter()
+        # Start on the first unrecorded line when skip mode is on
+        if self.unrecorded_var.get():
+            for i, r in enumerate(self.filtered_rows):
+                if not self._wav_path(r).exists():
+                    self.idx = i
+                    self._update_line_browser()
+                    self._update_display()
+                    break
         self._update_progress()
 
     # -----------------------------------------------------------------------
@@ -674,8 +684,8 @@ class VoiceBooth(tk.Tk):
 
         self.unrecorded_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
-            filt, text="Unrecorded only", variable=self.unrecorded_var,
-            command=self._apply_filter, font=("Segoe UI", 8),
+            filt, text="Skip recorded \u2192", variable=self.unrecorded_var,
+            command=self._update_display, font=("Segoe UI", 8),
             bg=BG, fg=FG_DIM, selectcolor=BG_MID,
             activebackground=BG, activeforeground=FG
         ).pack(side="right")
@@ -778,6 +788,10 @@ class VoiceBooth(tk.Tk):
     def _wav_path(self, row: dict) -> Path:
         return OUTPUT_DIR / f"{row['strref']}.wav"
 
+    def _strip_check(self, text: str) -> str:
+        """Remove the leading ✔ completion mark from a dropdown value."""
+        return text[2:] if text.startswith("\u2714 ") else text
+
     def _get_context(self, row: dict) -> tuple[dict | None, dict | None]:
         """Return (prev_line, next_line) from the same dialogue."""
         conv = self.dlg_conv_order.get(row["dlg_file"], [])
@@ -840,7 +854,17 @@ class VoiceBooth(tk.Tk):
             self.lbl_recorded.config(text="", fg=GREEN)
 
         # Nav counter
-        self.lbl_nav.config(text=f"{self.idx + 1} / {len(self.filtered_rows)}")
+        if self.unrecorded_var.get():
+            remaining = sum(1 for r in self.filtered_rows
+                            if not self._wav_path(r).exists())
+            if remaining == 0:
+                extra = "  \u2714 all recorded"
+            else:
+                extra = f"  ({remaining} unrecorded)"
+        else:
+            extra = ""
+        self.lbl_nav.config(
+            text=f"{self.idx + 1} / {len(self.filtered_rows)}{extra}")
 
         # Sync line browser selection
         if hasattr(self, "line_cb") and self.filtered_rows and self.line_cb.cget("values"):
@@ -870,8 +894,6 @@ class VoiceBooth(tk.Tk):
         if self.filtered_rows and self.idx > 0:
             self.idx -= 1
             self._update_display()
-            if self.instant_rec_var.get():
-                self.after(50, self._start_record)
 
     def _next(self):
         if self.is_recording:
@@ -880,29 +902,81 @@ class VoiceBooth(tk.Tk):
                 self._stop_record_internal()
             else:
                 return
-        if self.filtered_rows and self.idx < len(self.filtered_rows) - 1:
-            self.idx += 1
-            self._update_display()
-            if self.instant_rec_var.get():
-                self.after(50, self._start_record)
+        if not self.filtered_rows:
+            return
+        if self.unrecorded_var.get():
+            # Skip forward to the next unrecorded line
+            for i in range(self.idx + 1, len(self.filtered_rows)):
+                if not self._wav_path(self.filtered_rows[i]).exists():
+                    self.idx = i
+                    self._update_display()
+                    if self.instant_rec_var.get():
+                        self.after(50, self._start_record)
+                    return
+            # No unrecorded lines ahead — stay put
+        else:
+            if self.idx < len(self.filtered_rows) - 1:
+                self.idx += 1
+                self._update_display()
+                if self.instant_rec_var.get():
+                    self.after(50, self._start_record)
 
     # -----------------------------------------------------------------------
     # Filtering
     # -----------------------------------------------------------------------
+    def _rebuild_area_dropdown(self):
+        """Refresh area dropdown, adding ✔ to fully-recorded areas."""
+        decorated = []
+        for area in self.areas:
+            rows = [r for r in self.all_rows if r["area"] == area]
+            if rows and all(self._wav_path(r).exists() for r in rows):
+                decorated.append(f"\u2714 {area}")
+            else:
+                decorated.append(area)
+        cur_raw = self._strip_check(self.area_var.get())
+        self.area_cb.config(values=["All Areas"] + decorated)
+        for v in ["All Areas"] + decorated:
+            if self._strip_check(v) == cur_raw:
+                self.area_var.set(v)
+                break
+
+    def _rebuild_char_dropdown(self):
+        """Refresh character dropdown, adding ✔ to fully-recorded characters."""
+        area = self._strip_check(self.area_var.get())
+        if area == "All Areas":
+            chars = self.all_characters
+            relevant = self.all_rows
+        else:
+            chars = self.area_characters.get(area, [])
+            relevant = [r for r in self.all_rows if r["area"] == area]
+        decorated = []
+        for ch in chars:
+            ch_rows = [r for r in relevant if r["character"] == ch]
+            if ch_rows and all(self._wav_path(r).exists() for r in ch_rows):
+                decorated.append(f"\u2714 {ch}")
+            else:
+                decorated.append(ch)
+        cur_raw = self._strip_check(self.char_var.get())
+        self.char_cb.config(values=["All Characters"] + decorated)
+        for v in ["All Characters"] + decorated:
+            if self._strip_check(v) == cur_raw:
+                self.char_var.set(v)
+                break
+
     def _on_area_changed(self):
         """When area filter changes, cascade: characters → dialogues → filter."""
-        area = self.area_var.get()
+        area = self._strip_check(self.area_var.get())
         if area == "All Areas":
             chars = self.all_characters
         else:
             chars = self.area_characters.get(area, [])
 
-        self.char_cb.config(values=["All Characters"] + chars)
-
         # Reset character selection if current choice isn't in the new area
-        if self.char_var.get() != "All Characters" and self.char_var.get() not in chars:
+        cur_char = self._strip_check(self.char_var.get())
+        if cur_char != "All Characters" and cur_char not in chars:
             self.char_var.set("All Characters")
 
+        self._rebuild_char_dropdown()
         self._on_char_changed()
 
     def _on_char_changed(self):
@@ -916,16 +990,30 @@ class VoiceBooth(tk.Tk):
 
     def _update_dlg_dropdown(self):
         """Rebuild DLG dropdown from current area/character selection."""
-        area = self.area_var.get()
-        char = self.char_var.get()
-        dlgs = sorted({
-            r["dlg_file"] for r in self.all_rows
+        area = self._strip_check(self.area_var.get())
+        char = self._strip_check(self.char_var.get())
+        relevant = [
+            r for r in self.all_rows
             if (area == "All Areas" or r["area"] == area)
             and (char == "All Characters" or r["character"] == char)
-        })
-        self.dlg_cb.config(values=["All Dialogues"] + dlgs)
-        if self.dlg_var.get() != "All Dialogues" and self.dlg_var.get() not in dlgs:
+        ]
+        dlgs = sorted({r["dlg_file"] for r in relevant})
+        decorated = []
+        for d in dlgs:
+            d_rows = [r for r in relevant if r["dlg_file"] == d]
+            if d_rows and all(self._wav_path(r).exists() for r in d_rows):
+                decorated.append(f"\u2714 {d}")
+            else:
+                decorated.append(d)
+        cur_raw = self._strip_check(self.dlg_var.get())
+        self.dlg_cb.config(values=["All Dialogues"] + decorated)
+        if cur_raw != "All Dialogues" and cur_raw not in dlgs:
             self.dlg_var.set("All Dialogues")
+        else:
+            for v in ["All Dialogues"] + decorated:
+                if self._strip_check(v) == cur_raw:
+                    self.dlg_var.set(v)
+                    break
 
     def _update_line_browser(self):
         """Rebuild the line dropdown from current filtered_rows."""
@@ -964,7 +1052,7 @@ class VoiceBooth(tk.Tk):
             # Skip "All Areas" / "All Characters" header entries
             if v.startswith("All "):
                 continue
-            if v.upper().startswith(ch):
+            if self._strip_check(v).upper().startswith(ch):
                 combobox.current(i)
                 combobox.event_generate("<<ComboboxSelected>>")
                 return
@@ -973,10 +1061,9 @@ class VoiceBooth(tk.Tk):
         if self.is_recording:
             return
 
-        area = self.area_var.get()
-        char = self.char_var.get()
-        dlg  = self.dlg_var.get()
-        unrecorded = self.unrecorded_var.get()
+        area = self._strip_check(self.area_var.get())
+        char = self._strip_check(self.char_var.get())
+        dlg  = self._strip_check(self.dlg_var.get())
         query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
 
         self.filtered_rows = [
@@ -984,7 +1071,6 @@ class VoiceBooth(tk.Tk):
             if (area == "All Areas" or r["area"] == area)
             and (char == "All Characters" or r["character"] == char)
             and (dlg == "All Dialogues" or r["dlg_file"] == dlg)
-            and (not unrecorded or not self._wav_path(r).exists())
             and (not query or query in r["text"].lower()
                  or query in r["character"].lower()
                  or query in r.get("strref", ""))
@@ -1152,6 +1238,9 @@ class VoiceBooth(tk.Tk):
             self._update_display()
             self._update_progress()
             self._update_line_browser()
+            self._rebuild_area_dropdown()
+            self._rebuild_char_dropdown()
+            self._update_dlg_dropdown()
 
         except Exception as exc:
             self.lbl_timer.config(text=f"\u2716 save failed", fg=ACCENT)
