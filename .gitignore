@@ -1,2 +1,4 @@
 __pycache__/
 voice_booth.cfg
+.claude/
+install/

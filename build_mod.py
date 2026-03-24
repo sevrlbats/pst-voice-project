@@ -6,8 +6,10 @@ copies WAV files from voice_recordings/ into the mod package,
 and generates a self-contained WeiDU .tp2 (no external includes).
 
 Usage:
-  python build_mod.py          # build the mod
-  setup-PST_Voice_Mod.exe      # install it (WeiDU)
+  python build_mod.py          # build the mod into install/
+  Then hand the install/ folder to the end user.
+  They copy its contents into their PST game directory and run
+  setup-PST_Voice_Mod.exe to install.
 """
 
 import csv
@@ -22,18 +24,21 @@ import soundfile as sf
 # Paths
 # ---------------------------------------------------------------------------
 PROJECT_DIR   = Path(__file__).parent
-GAME_DIR      = Path(r"C:\Program Files (x86)\Steam\steamapps\common\Project P")
 CSV_PATH      = PROJECT_DIR / "unvoiced_dialog.csv"
 RECORDINGS    = PROJECT_DIR / "voice_recordings"
 CREDITS_SRC   = RECORDINGS / "CREDITS.txt"
 
-# Mod output goes to game dir (where WeiDU needs it)
-MOD_DIR       = GAME_DIR / "PST_Voice_Mod"
+# Mod output goes into install/ (distributable package)
+INSTALL_DIR   = PROJECT_DIR / "install"
+MOD_DIR       = INSTALL_DIR / "PST_Voice_Mod"
 MOD_AUDIO     = MOD_DIR / "audio"
-TP2_PATH      = GAME_DIR / "setup-PST_Voice_Mod.tp2"
+TP2_PATH      = INSTALL_DIR / "setup-PST_Voice_Mod.tp2"
+WEIDU_SRC     = PROJECT_DIR / "setup-PST_Voice_Mod.exe"
+WEIDU_DST     = INSTALL_DIR / "setup-PST_Voice_Mod.exe"
 
-# Volume boost applied at build time (original recordings are untouched)
-GAIN          = 9.0
+# Per-file peak normalization: every WAV ends up at this peak amplitude.
+# 30000 leaves a hair of headroom below int16 max (32767).
+TARGET_PEAK   = 32700
 
 
 def main():
@@ -81,22 +86,29 @@ def main():
     MOD_AUDIO.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # 3. Copy WAV files from voice_recordings/ into mod audio folder
+    # 3. Bundle WeiDU launcher into install/
     # ------------------------------------------------------------------
-    copied = 0
-    clipped = 0
+    if WEIDU_SRC.exists():
+        shutil.copy2(WEIDU_SRC, WEIDU_DST)
+        print(f"Bundled {WEIDU_SRC.name} into {INSTALL_DIR}")
+    else:
+        print(f"WARNING: {WEIDU_SRC.name} not found in project root — skipping bundle")
+
+    # ------------------------------------------------------------------
+    # 4. Peak-normalize and copy WAV files into mod audio folder
+    # ------------------------------------------------------------------
+    # Pass 1: scan every source file to measure its peak amplitude
+    print("Scanning audio levels...")
+    file_peaks: dict[str, float] = {}
+    sample_rates: dict[str, int] = {}
     missing = []
     for e in entries:
         src = RECORDINGS / e["wav_name"]
-        dst = MOD_AUDIO / f"{e['resref']}.wav"
         if src.exists():
             data, sr = sf.read(str(src), dtype="int16")
-            boosted = data.astype(np.float64) * GAIN
-            boosted = np.clip(boosted, -32768, 32767).astype(np.int16)
-            if np.any(np.abs(data.astype(np.float64) * GAIN) > 32767):
-                clipped += 1
-            sf.write(str(dst), boosted, sr, subtype="PCM_16")
-            copied += 1
+            peak = float(np.max(np.abs(data.astype(np.float64))))
+            file_peaks[e["wav_name"]] = max(peak, 1.0)   # floor avoids /0
+            sample_rates[e["wav_name"]] = sr
         else:
             missing.append(f"  {e['wav_name']} (strref {e['strref']}, {e['char']})")
 
@@ -108,12 +120,36 @@ def main():
             print(f"  ... and {len(missing) - 20} more")
         print()
 
-    print(f"Copied {copied} audio files to {MOD_AUDIO} (gain: {GAIN}x)")
-    if clipped:
-        print(f"  Note: {clipped} file(s) had peaks clipped at {GAIN}x gain")
+    if not file_peaks:
+        print("ERROR: No audio files found — nothing to build.")
+        sys.exit(1)
+
+    global_max = max(file_peaks.values())
+    global_min = min(file_peaks.values())
+    print(f"  Peak range: {global_min:.0f} – {global_max:.0f}")
+    print(f"  Gain range: {TARGET_PEAK / global_max:.1f}x (loudest) "
+          f"– {TARGET_PEAK / global_min:.1f}x (quietest)")
+
+    # Pass 2: normalize each file so its peak = TARGET_PEAK
+    copied = 0
+    for e in entries:
+        wav = e["wav_name"]
+        if wav not in file_peaks:
+            continue                                       # already in missing
+        src = RECORDINGS / wav
+        dst = MOD_AUDIO / f"{e['resref']}.wav"
+        data, sr = sf.read(str(src), dtype="int16")
+        gain = TARGET_PEAK / file_peaks[wav]
+        boosted = data.astype(np.float64) * gain
+        boosted = np.clip(boosted, -32768, 32767).astype(np.int16)
+        sf.write(str(dst), boosted, sr, subtype="PCM_16")
+        copied += 1
+
+    print(f"Normalized {copied} audio files to {MOD_AUDIO} "
+          f"(target peak: {TARGET_PEAK})")
 
     # ------------------------------------------------------------------
-    # 4. Generate self-contained .tp2
+    # 5. Generate self-contained .tp2
     # ------------------------------------------------------------------
     # We use STRING_SET to patch dialog.tlk — the proper WeiDU way.
     # dialog.tlk is NOT a chitin.key resource, so COPY_EXISTING won't
@@ -154,7 +190,7 @@ def main():
     print(f"Generated TP2: {TP2_PATH}")
 
     # ------------------------------------------------------------------
-    # 5. Copy credits if available
+    # 6. Copy credits if available
     # ------------------------------------------------------------------
     if CREDITS_SRC.exists():
         shutil.copy2(CREDITS_SRC, MOD_DIR / "CREDITS.txt")
@@ -164,18 +200,17 @@ def main():
     # Done
     # ------------------------------------------------------------------
     print(f"\n{'='*50}")
-    print(f"  Mod built: {MOD_DIR}")
+    print(f"  Mod built: {INSTALL_DIR}")
     print(f"  {len(entries)} dialog lines | {copied} audio files")
     print(f"{'='*50}")
     print()
-    print("To install:")
-    print("  1. Download WeiDU from https://github.com/WeiDUorg/weidu/releases")
-    print(f"  2. Copy weidu.exe into: {GAME_DIR}")
-    print(f"  3. Rename it to: setup-PST_Voice_Mod.exe")
-    print(f"  4. Double-click setup-PST_Voice_Mod.exe")
+    print("To distribute:")
+    print("  Hand the entire install/ folder to the end user.")
     print()
-    print("The tp2 is named setup-PST_Voice_Mod.tp2 so WeiDU finds it")
-    print("automatically when you run setup-PST_Voice_Mod.exe.")
+    print("End-user install instructions:")
+    print("  1. Copy the contents of install/ into your PST game directory")
+    print("     (setup-PST_Voice_Mod.exe, setup-PST_Voice_Mod.tp2, PST_Voice_Mod/)")
+    print("  2. Double-click setup-PST_Voice_Mod.exe")
 
 
 if __name__ == "__main__":

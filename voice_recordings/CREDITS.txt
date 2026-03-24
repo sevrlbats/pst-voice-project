@@ -6,11 +6,19 @@ This mod adds voiceover to previously unvoiced dialogue
 in Planescape: Torment. The following voice actors
 generously contributed their talents:
 
-  sevrL_bats
-    as Advocate, Awaiting-Death, Dhall
-       Dustman, Dustman Guard, Ei-Vene
-       Giant Skeleton, Morte, Soego
+  Charles Wulf
+    as Baen the Sender
 
-  Total lines voiced: 595
+  InfinityOnWes
+    as Angyar
+
+  sevrL_bats
+    as Advocate, Awaiting-Death, Corvus
+       Deionarra, Dhall, Dustman
+       Dustman Guard, Ei-Vene, Giant Skeleton
+       Morte, O, Soego
+       Zombie Worker
+
+  Total lines voiced: 678
 
 ============================================================

@@ -17,16 +17,26 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+import zipfile
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+
+# Optional RAR support
+try:
+    import rarfile
+    _HAS_RAR = True
+except ImportError:
+    _HAS_RAR = False
 
 # ---------------------------------------------------------------------------
 # Config
@@ -34,10 +44,11 @@ import soundfile as sf
 SAMPLE_RATE  = 22050
 CHANNELS     = 1
 SUBTYPE      = "PCM_16"
-OUTPUT_DIR   = Path(__file__).parent / "voice_recordings"
-CSV_PATH     = Path(__file__).parent / "unvoiced_dialog.csv"
-CONFIG_PATH  = Path(__file__).parent / "voice_booth.cfg"
-CREDITS_PATH = Path(__file__).parent / "voice_recordings" / "CREDITS.txt"
+_SCRIPT_DIR  = Path(__file__).resolve().parent
+OUTPUT_DIR   = _SCRIPT_DIR / "voice_recordings"
+CSV_PATH     = _SCRIPT_DIR / "unvoiced_dialog.csv"
+CONFIG_PATH  = _SCRIPT_DIR / "voice_booth.cfg"
+CREDITS_PATH = _SCRIPT_DIR / "voice_recordings" / "CREDITS.txt"
 
 # CSV columns (voice_actor is appended if missing)
 CSV_FIELDS   = ["area", "dlg_file", "character", "line_type",
@@ -58,6 +69,22 @@ ACCENT       = "#e94560"
 ACCENT_GLOW  = "#ff6b81"
 GREEN        = "#2ecc71"
 GOLD         = "#f1c40f"
+
+# ---------------------------------------------------------------------------
+# Milestone jokes — shown every 100 recordings to keep spirits up
+# ---------------------------------------------------------------------------
+MILESTONE_JOKES = {
+    100: "What can change the nature of a man?\n…Apparently, recording 100 voice lines.",
+    200: "200 lines down. Morte would be proud.\nOr he'd make a skull pun. Probably the pun.",
+    300: "300! You are become The Practical Incarnation:\nthe one who actually finishes things.",
+    400: "Fall-from-Grace says 400 recordings\nshows 'admirable commitment to the craft.'\nShe's being polite. Keep going.",
+    500: "HALFWAY THERE.\nIgnus would set off fireworks,\nbut that's just called 'Ignus.'",
+    600: "600 lines. Dak'kon's blade has grown\ntwo inches from your *zeal* alone.\n*Endure. In enduring, grow strong.*",
+    700: "700! Nordom would like you to know\nthat completion probability has\nimproved by 12.7%. Affirmative.",
+    800: "800 recordings. Vhailor's helm trembles.\nJUSTICE for every unvoiced line\nis within reach.",
+    900: "900. Even Ravel would admit\nyou've answered her question by now:\n'What can change the nature of a mod?'\nSheer bloody-mindedness.",
+    1000: "ONE THOUSAND LINES RECORDED.\nUpdated my journal.\n…Wait, wrong game.",
+}
 
 # ---------------------------------------------------------------------------
 # Area ordering — loose game progression
@@ -507,6 +534,27 @@ class VoiceBooth(tk.Tk):
             activebackground=BG, activeforeground=FG)
         self.pin_btn.pack(side="right")
 
+        self.btn_import = tk.Button(
+            top, text="\u2b07 Import", font=("Segoe UI", 9, "bold"),
+            bg=BG_MID, fg=FG, activebackground=BG_DARK, activeforeground=FG,
+            bd=0, relief="flat", cursor="hand2", padx=8, pady=2,
+            command=self._import_archive)
+        self.btn_import.pack(side="right", padx=(0, 6))
+
+        self.btn_export = tk.Button(
+            top, text="\u2b06 Export", font=("Segoe UI", 9, "bold"),
+            bg=BG_MID, fg=FG, activebackground=BG_DARK, activeforeground=FG,
+            bd=0, relief="flat", cursor="hand2", padx=8, pady=2,
+            command=self._export_archive)
+        self.btn_export.pack(side="right", padx=(0, 4))
+
+        self.btn_template = tk.Button(
+            top, text="\U0001f4e6 Template", font=("Segoe UI", 9, "bold"),
+            bg=BG_MID, fg=FG, activebackground=BG_DARK, activeforeground=FG,
+            bd=0, relief="flat", cursor="hand2", padx=8, pady=2,
+            command=self._create_template)
+        self.btn_template.pack(side="right", padx=(0, 4))
+
         # --- Voice actor name ---
         voice_row = tk.Frame(self, bg=BG)
         voice_row.pack(fill="x", padx=10, pady=(2, 2))
@@ -676,11 +724,10 @@ class VoiceBooth(tk.Tk):
 
         self.char_var = tk.StringVar(value="All Characters")
         self.char_cb = ttk.Combobox(filt, textvariable=self.char_var, width=18,
-                                    values=["All Characters"] + self.all_characters,
-                                    state="readonly")
+                                    values=["All Characters"] + self.all_characters)
         self.char_cb.pack(side="left", padx=(0, 6))
         self.char_cb.bind("<<ComboboxSelected>>", lambda e: self._on_char_changed())
-        self._bind_key_jump(self.char_cb)
+        self.char_cb.bind("<KeyRelease>", self._on_char_search)
 
         self.unrecorded_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
@@ -733,9 +780,17 @@ class VoiceBooth(tk.Tk):
 
         self.line_var = tk.StringVar()
         self.line_cb = ttk.Combobox(line_row, textvariable=self.line_var,
-                                    state="readonly", width=52)
+                                    state="readonly", width=42)
         self.line_cb.pack(side="left", padx=(4, 0))
         self.line_cb.bind("<<ComboboxSelected>>", lambda e: self._on_line_selected())
+
+        self.hide_recorded_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            line_row, text="Hide recorded", variable=self.hide_recorded_var,
+            command=self._on_hide_recorded_changed, font=("Segoe UI", 8),
+            bg=BG, fg=FG_DIM, selectcolor=BG_MID,
+            activebackground=BG, activeforeground=FG
+        ).pack(side="right")
 
         # --- Progress bar ---
         prog = tk.Frame(self, bg=BG)
@@ -756,8 +811,9 @@ class VoiceBooth(tk.Tk):
         # Guard: don't fire shortcuts while typing in the voice name field
         def _guard(action):
             def wrapper(event):
-                if event.widget in (self.voice_entry, self.search_entry):
-                    return  # let the Entry handle it normally
+                if event.widget in (self.voice_entry, self.search_entry,
+                                    self.char_cb):
+                    return  # let the Entry/Combobox handle it normally
                 action()
                 return "break"
             return wrapper
@@ -868,7 +924,14 @@ class VoiceBooth(tk.Tk):
 
         # Sync line browser selection
         if hasattr(self, "line_cb") and self.filtered_rows and self.line_cb.cget("values"):
-            self.line_cb.current(self.idx)
+            bmap = getattr(self, "_line_browser_map", None)
+            if bmap:
+                try:
+                    self.line_cb.current(bmap.index(self.idx))
+                except ValueError:
+                    pass  # current line is hidden from browser
+            else:
+                self.line_cb.current(self.idx)
 
         # Conversation context
         prev_r, next_r = self._get_context(row)
@@ -876,10 +939,33 @@ class VoiceBooth(tk.Tk):
         self.lbl_ctx_next.config(text=self._fmt_context(next_r, "\u25bc"))
 
     def _update_progress(self):
-        total = len(self.all_rows)
-        done = sum(1 for r in self.all_rows if self._wav_path(r).exists())
+        # Count unique texts — duplicates only need one recording
+        seen: dict[str, bool] = {}
+        for r in self.all_rows:
+            t = r["text"]
+            if t not in seen:
+                seen[t] = False
+            if self._wav_path(r).exists():
+                seen[t] = True
+        total = len(seen)
+        done = sum(1 for v in seen.values() if v)
         pct = (done / total * 100) if total else 0
         self.lbl_progress.config(text=f"Progress: {done:,} / {total:,}  ({pct:.1f}%)")
+        self._last_done_count = done          # stash for milestone check
+
+    def _check_milestone(self):
+        """Show a Planescape joke when total recordings cross a 100-mark."""
+        done = getattr(self, "_last_done_count", 0)
+        joke = MILESTONE_JOKES.get(done)
+        if joke:
+            messagebox.showinfo(f"\U0001f3c6  {done} Recordings!", joke)
+
+    def _on_hide_recorded_changed(self):
+        """Toggle hiding of fully-recorded items from all dropdowns."""
+        self._rebuild_area_dropdown()
+        self._rebuild_char_dropdown()
+        self._update_dlg_dropdown()
+        self._apply_filter()
 
     # -----------------------------------------------------------------------
     # Navigation
@@ -925,23 +1011,36 @@ class VoiceBooth(tk.Tk):
     # Filtering
     # -----------------------------------------------------------------------
     def _rebuild_area_dropdown(self):
-        """Refresh area dropdown, adding ✔ to fully-recorded areas."""
+        """Refresh area dropdown, adding ✔ to fully-recorded areas
+        (or hiding them entirely when 'Hide recorded' is on)."""
+        hide = getattr(self, "hide_recorded_var", None)
+        hide = hide.get() if hide else False
         decorated = []
         for area in self.areas:
             rows = [r for r in self.all_rows if r["area"] == area]
-            if rows and all(self._wav_path(r).exists() for r in rows):
+            fully_done = rows and all(self._wav_path(r).exists() for r in rows)
+            if hide and fully_done:
+                continue
+            if fully_done:
                 decorated.append(f"\u2714 {area}")
             else:
                 decorated.append(area)
         cur_raw = self._strip_check(self.area_var.get())
         self.area_cb.config(values=["All Areas"] + decorated)
+        found = False
         for v in ["All Areas"] + decorated:
             if self._strip_check(v) == cur_raw:
                 self.area_var.set(v)
+                found = True
                 break
+        if not found:
+            self.area_var.set("All Areas")
 
     def _rebuild_char_dropdown(self):
-        """Refresh character dropdown, adding ✔ to fully-recorded characters."""
+        """Refresh character dropdown, adding ✔ to fully-recorded characters
+        (or hiding them entirely when 'Hide recorded' is on)."""
+        hide = getattr(self, "hide_recorded_var", None)
+        hide = hide.get() if hide else False
         area = self._strip_check(self.area_var.get())
         if area == "All Areas":
             chars = self.all_characters
@@ -952,16 +1051,23 @@ class VoiceBooth(tk.Tk):
         decorated = []
         for ch in chars:
             ch_rows = [r for r in relevant if r["character"] == ch]
-            if ch_rows and all(self._wav_path(r).exists() for r in ch_rows):
+            fully_done = ch_rows and all(self._wav_path(r).exists() for r in ch_rows)
+            if hide and fully_done:
+                continue
+            if fully_done:
                 decorated.append(f"\u2714 {ch}")
             else:
                 decorated.append(ch)
         cur_raw = self._strip_check(self.char_var.get())
         self.char_cb.config(values=["All Characters"] + decorated)
+        found = False
         for v in ["All Characters"] + decorated:
             if self._strip_check(v) == cur_raw:
                 self.char_var.set(v)
+                found = True
                 break
+        if not found:
+            self.char_var.set("All Characters")
 
     def _on_area_changed(self):
         """When area filter changes, cascade: characters → dialogues → filter."""
@@ -979,8 +1085,58 @@ class VoiceBooth(tk.Tk):
         self._rebuild_char_dropdown()
         self._on_char_changed()
 
+    def _on_char_search(self, event):
+        """Filter character dropdown as user types, searching all areas."""
+        if event.keysym in ("Down", "Up", "Left", "Right", "Tab",
+                            "Shift_L", "Shift_R", "Control_L", "Control_R",
+                            "Alt_L", "Alt_R", "Escape"):
+            return
+
+        typed = self.char_var.get().strip()
+
+        # Cleared or reset — restore full area-aware list
+        if not typed or typed.lower() == "all characters":
+            self._rebuild_char_dropdown()
+            return
+
+        # Return key: pick the best match and apply
+        if event.keysym == "Return":
+            query = typed.lower()
+            matches = [c for c in self.all_characters
+                       if query in c.lower()]
+            if matches:
+                exact = [c for c in matches if c.lower() == query]
+                self.char_var.set(exact[0] if exact else matches[0])
+                self._on_char_changed()
+            return
+
+        # Substring filter across ALL characters regardless of area
+        query = typed.lower()
+        matches = [c for c in self.all_characters
+                   if query in c.lower()]
+        self.char_cb.config(
+            values=matches if matches else ["(no matches)"])
+
+        # Open/refresh the dropdown to show filtered matches.
+        # Preserve cursor position since posting the dropdown can reset it.
+        cursor_pos = self.char_cb.index("insert")
+        try:
+            self.tk.call("ttk::combobox::Post", self.char_cb)
+        except Exception:
+            pass
+        self.char_cb.icursor(cursor_pos)
+
     def _on_char_changed(self):
-        """When character filter changes, cascade: dialogues → filter."""
+        """When character filter changes, cascade: dialogues → filter.
+        Auto-widens to All Areas if the character isn't in the current area."""
+        char = self._strip_check(self.char_var.get())
+        if char != "All Characters" and char in self.all_characters:
+            area = self._strip_check(self.area_var.get())
+            if area != "All Areas":
+                area_chars = self.area_characters.get(area, [])
+                if char not in area_chars:
+                    self.area_var.set("All Areas")
+                    self._rebuild_area_dropdown()
         self._update_dlg_dropdown()
         self._apply_filter()
 
@@ -989,9 +1145,15 @@ class VoiceBooth(tk.Tk):
         self._apply_filter()
 
     def _update_dlg_dropdown(self):
-        """Rebuild DLG dropdown from current area/character selection."""
+        """Rebuild DLG dropdown from current area/character selection.
+        Hides fully-recorded DLGs when 'Hide recorded' is on."""
+        hide = getattr(self, "hide_recorded_var", None)
+        hide = hide.get() if hide else False
         area = self._strip_check(self.area_var.get())
         char = self._strip_check(self.char_var.get())
+        # Ignore partial character text from mid-search
+        if char != "All Characters" and char not in self.all_characters:
+            char = "All Characters"
         relevant = [
             r for r in self.all_rows
             if (area == "All Areas" or r["area"] == area)
@@ -1001,7 +1163,10 @@ class VoiceBooth(tk.Tk):
         decorated = []
         for d in dlgs:
             d_rows = [r for r in relevant if r["dlg_file"] == d]
-            if d_rows and all(self._wav_path(r).exists() for r in d_rows):
+            fully_done = d_rows and all(self._wav_path(r).exists() for r in d_rows)
+            if hide and fully_done:
+                continue
+            if fully_done:
                 decorated.append(f"\u2714 {d}")
             else:
                 decorated.append(d)
@@ -1010,29 +1175,50 @@ class VoiceBooth(tk.Tk):
         if cur_raw != "All Dialogues" and cur_raw not in dlgs:
             self.dlg_var.set("All Dialogues")
         else:
+            found = False
             for v in ["All Dialogues"] + decorated:
                 if self._strip_check(v) == cur_raw:
                     self.dlg_var.set(v)
+                    found = True
                     break
+            if not found:
+                self.dlg_var.set("All Dialogues")
 
     def _update_line_browser(self):
-        """Rebuild the line dropdown from current filtered_rows."""
+        """Rebuild the line dropdown from current filtered_rows.
+        When 'Hide recorded' is on, recorded lines are omitted and an
+        index map translates between display position and filtered_rows index."""
+        hide = getattr(self, "hide_recorded_var", None)
+        hide = hide.get() if hide else False
         previews = []
-        for r in self.filtered_rows:
-            mark = "\u2714" if self._wav_path(r).exists() else "  "
+        self._line_browser_map: list[int] = []
+        for i, r in enumerate(self.filtered_rows):
+            recorded = self._wav_path(r).exists()
+            if hide and recorded:
+                continue
+            mark = "\u2714" if recorded else "  "
             text = r["text"].replace("\r", "").replace("\n", " ")[:45]
             previews.append(f"{mark} #{r['strref']}  {text}")
+            self._line_browser_map.append(i)
         self.line_cb.config(values=previews)
-        if previews and self.idx < len(previews):
-            self.line_cb.current(self.idx)
-        elif not previews:
+        if previews:
+            try:
+                display_idx = self._line_browser_map.index(self.idx)
+            except ValueError:
+                display_idx = 0
+            self.line_cb.current(display_idx)
+        else:
             self.line_var.set("")
 
     def _on_line_selected(self):
         """Jump to the line chosen in the line browser."""
-        idx = self.line_cb.current()
-        if 0 <= idx < len(self.filtered_rows):
-            self.idx = idx
+        display_idx = self.line_cb.current()
+        bmap = getattr(self, "_line_browser_map", None)
+        if bmap and 0 <= display_idx < len(bmap):
+            self.idx = bmap[display_idx]
+            self._update_display()
+        elif 0 <= display_idx < len(self.filtered_rows):
+            self.idx = display_idx
             self._update_display()
 
     def _bind_key_jump(self, combobox: ttk.Combobox):
@@ -1065,6 +1251,11 @@ class VoiceBooth(tk.Tk):
         char = self._strip_check(self.char_var.get())
         dlg  = self._strip_check(self.dlg_var.get())
         query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
+
+        # If char text doesn't match a known character, ignore it
+        # (user is mid-search in the character combobox)
+        if char != "All Characters" and char not in self.all_characters:
+            char = "All Characters"
 
         self.filtered_rows = [
             r for r in self.all_rows
@@ -1241,6 +1432,7 @@ class VoiceBooth(tk.Tk):
             self._rebuild_area_dropdown()
             self._rebuild_char_dropdown()
             self._update_dlg_dropdown()
+            self._check_milestone()
 
         except Exception as exc:
             self.lbl_timer.config(text=f"\u2716 save failed", fg=ACCENT)
@@ -1284,6 +1476,446 @@ class VoiceBooth(tk.Tk):
         if self.is_playing:
             self.is_playing = False
             self.btn_play.config(text="\u25b6 Play", bg=BG_MID)
+
+    # -----------------------------------------------------------------------
+    # Import
+    # -----------------------------------------------------------------------
+    def _import_archive(self):
+        """Import voice recordings from a ZIP/RAR archive sent by a voice actor."""
+        if self.is_recording:
+            messagebox.showwarning("Import", "Cannot import while recording.")
+            return
+
+        # Build file type filter
+        ftypes = [("ZIP archives", "*.zip")]
+        if _HAS_RAR:
+            ftypes.append(("RAR archives", "*.rar"))
+        ftypes.append(("All files", "*.*"))
+
+        archive_path = filedialog.askopenfilename(
+            title="Import Voice Actor Archive",
+            filetypes=ftypes,
+            parent=self)
+
+        if not archive_path:
+            return  # user cancelled
+
+        archive_path = Path(archive_path)
+        tmp_dir = None
+
+        try:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="pst_voice_import_"))
+
+            # --- Extract archive ---
+            suffix = archive_path.suffix.lower()
+            if suffix == ".zip":
+                with zipfile.ZipFile(archive_path, "r") as zf:
+                    zf.extractall(tmp_dir)
+            elif suffix == ".rar":
+                if not _HAS_RAR:
+                    messagebox.showerror("Import Error",
+                        "RAR support requires the 'rarfile' package.\n\n"
+                        "Install it with:  pip install rarfile\n\n"
+                        "You will also need UnRAR installed on your system.")
+                    return
+                with rarfile.RarFile(archive_path, "r") as rf:
+                    rf.extractall(tmp_dir)
+            else:
+                # Try ZIP first, then RAR
+                try:
+                    with zipfile.ZipFile(archive_path, "r") as zf:
+                        zf.extractall(tmp_dir)
+                except zipfile.BadZipFile:
+                    if _HAS_RAR:
+                        try:
+                            with rarfile.RarFile(archive_path, "r") as rf:
+                                rf.extractall(tmp_dir)
+                        except Exception:
+                            messagebox.showerror("Import Error",
+                                "Could not open file as ZIP or RAR archive.")
+                            return
+                    else:
+                        messagebox.showerror("Import Error",
+                            "File is not a valid ZIP archive.\n"
+                            "For RAR support, install: pip install rarfile")
+                        return
+
+            # --- Find CSV in extracted tree ---
+            import_csv_path = None
+            for dirpath, _dirnames, filenames in os.walk(tmp_dir):
+                for fn in filenames:
+                    if (fn.lower().startswith("unvoiced_dialog")
+                            and fn.lower().endswith(".csv")):
+                        import_csv_path = Path(dirpath) / fn
+                        break
+                if import_csv_path:
+                    break
+
+            if not import_csv_path:
+                messagebox.showerror("Import Error",
+                    "No CSV file matching 'unvoiced_dialog*.csv' "
+                    "found in the archive.")
+                return
+
+            # --- Find all WAV files and build strref -> path map ---
+            wav_map: dict[str, Path] = {}
+            for dirpath, _dirnames, filenames in os.walk(tmp_dir):
+                for fn in filenames:
+                    if fn.lower().endswith(".wav"):
+                        wav_map[Path(fn).stem] = Path(dirpath) / fn
+
+            # --- Load imported CSV ---
+            try:
+                import_rows = load_csv(import_csv_path)
+            except Exception as exc:
+                messagebox.showerror("Import Error",
+                    f"Could not read CSV:\n{import_csv_path.name}\n\n{exc}")
+                return
+
+            # --- Build strref lookup for master rows ---
+            master_by_strref: dict[str, dict] = {}
+            for r in self.all_rows:
+                master_by_strref[r["strref"]] = r
+
+            # --- Process each imported row ---
+            imported = 0
+            conflicts: list[dict] = []
+            skipped = 0
+            errors: list[str] = []
+
+            for imp_row in import_rows:
+                vf = imp_row.get("voice_file", "").strip()
+                if not vf:
+                    continue  # no recording for this line
+
+                strref = imp_row.get("strref", "").strip()
+                if not strref:
+                    continue
+
+                master_row = master_by_strref.get(strref)
+                if master_row is None:
+                    errors.append(
+                        f"strref {strref}: not found in master CSV")
+                    skipped += 1
+                    continue
+
+                # Find the WAV file
+                wav_stem = Path(vf).stem
+                wav_source = wav_map.get(wav_stem) or wav_map.get(strref)
+
+                if wav_source is None:
+                    errors.append(
+                        f"strref {strref}: WAV file '{vf}' not in archive")
+                    skipped += 1
+                    continue
+
+                # Check for conflict — master already has a recording
+                dest_path = OUTPUT_DIR / f"{strref}.wav"
+                if dest_path.exists():
+                    conflicts.append({
+                        "strref": strref,
+                        "character": imp_row.get("character", ""),
+                        "master_actor": master_row.get("voice_actor", ""),
+                        "import_actor": imp_row.get("voice_actor", ""),
+                        "text": imp_row.get("text", "")[:80],
+                    })
+                    continue
+
+                # Copy WAV to local voice_recordings/
+                try:
+                    shutil.copy2(str(wav_source), str(dest_path))
+                except Exception as exc:
+                    errors.append(
+                        f"strref {strref}: copy failed - {exc}")
+                    skipped += 1
+                    continue
+
+                # Update master row
+                master_row["voice_file"] = f"{strref}.wav"
+                actor = imp_row.get("voice_actor", "").strip()
+                if actor:
+                    master_row["voice_actor"] = actor
+
+                imported += 1
+
+                # Propagate to duplicate-text rows
+                dupes = self.text_duplicates.get(master_row["text"], [])
+                for dupe_row in dupes:
+                    if dupe_row is master_row:
+                        continue
+                    if self._wav_path(dupe_row).exists():
+                        continue
+                    try:
+                        dupe_dest = self._wav_path(dupe_row)
+                        shutil.copy2(str(dest_path), str(dupe_dest))
+                        dupe_row["voice_file"] = f"{dupe_row['strref']}.wav"
+                        if actor:
+                            dupe_row["voice_actor"] = actor
+                        imported += 1
+                    except Exception:
+                        pass  # non-fatal
+
+            # --- Write conflicts file if any ---
+            conflicts_file = None
+            if conflicts:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                conflicts_file = _SCRIPT_DIR / f"conflicts_{stamp}.txt"
+                lines = []
+                lines.append(f"Import conflicts from: {archive_path.name}")
+                lines.append(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                lines.append(f"Total conflicts: {len(conflicts)}")
+                lines.append("")
+                lines.append("These lines were NOT imported because "
+                             "a recording already exists in the master.")
+                lines.append("=" * 70)
+                for c in conflicts:
+                    lines.append("")
+                    lines.append(f"  strref:       {c['strref']}")
+                    lines.append(f"  character:    {c['character']}")
+                    lines.append(f"  master actor: {c['master_actor'] or '(unknown)'}")
+                    lines.append(f"  import actor: {c['import_actor'] or '(unknown)'}")
+                    lines.append(f"  text:         {c['text']}")
+                    lines.append("-" * 70)
+                conflicts_file.write_text(
+                    "\n".join(lines), encoding="utf-8")
+
+            # --- Persist changes ---
+            save_csv(CSV_PATH, self.all_rows)
+            generate_credits(self.all_rows, CREDITS_PATH)
+
+            # --- Refresh entire UI ---
+            self._rebuild_area_dropdown()
+            self._rebuild_char_dropdown()
+            self._update_dlg_dropdown()
+            self._apply_filter()
+            self._update_display()
+            self._update_progress()
+            self._update_line_browser()
+
+            # --- Identify the actor for the title ---
+            actor_name = ""
+            for imp_row in import_rows:
+                a = imp_row.get("voice_actor", "").strip()
+                if a:
+                    actor_name = a
+                    break
+
+            # --- Summary dialog ---
+            title = "Import Complete"
+            if actor_name:
+                title = f"Import Complete \u2014 {actor_name}"
+
+            parts = [f"Imported: {imported} lines"]
+            if conflicts:
+                parts.append(
+                    f"Skipped: {len(conflicts)} conflicts "
+                    f"(master recording exists)")
+                parts.append(f"\nConflict report saved to:\n"
+                             f"{conflicts_file.name}")
+            if errors:
+                parts.append(f"Errors: {skipped}")
+                parts.append("\nDetails:")
+                parts.extend(errors[:15])
+                if len(errors) > 15:
+                    parts.append(f"... and {len(errors) - 15} more")
+
+            messagebox.showinfo(title, "\n".join(parts))
+
+        except Exception as exc:
+            messagebox.showerror("Import Error",
+                f"An unexpected error occurred during import:\n\n{exc}")
+        finally:
+            if tmp_dir and tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # -----------------------------------------------------------------------
+    # Export
+    # -----------------------------------------------------------------------
+    def _export_archive(self):
+        """Export this actor's recordings as a ZIP ready to send back."""
+        if self.is_recording:
+            messagebox.showwarning("Export", "Cannot export while recording.")
+            return
+
+        actor = self.voice_var.get().strip()
+        if not actor:
+            messagebox.showwarning("Export",
+                "Please enter your voice actor name before exporting.\n\n"
+                "This is used to identify which recordings are yours.")
+            self.voice_entry.focus_set()
+            return
+
+        # Find rows voiced by this actor
+        my_rows = [r for r in self.all_rows
+                   if r.get("voice_actor", "").strip() == actor
+                   and r.get("voice_file", "").strip()]
+
+        if not my_rows:
+            messagebox.showinfo("Export",
+                f"No recordings found for voice actor \"{actor}\".\n\n"
+                "Record some lines first, then export.")
+            return
+
+        # Collect WAV files that actually exist
+        wav_files: list[tuple[Path, str]] = []  # (source_path, archive_name)
+        missing = 0
+        for r in my_rows:
+            src = self._wav_path(r)
+            if src.exists():
+                wav_files.append((src, f"voice_recordings/{src.name}"))
+            else:
+                missing += 1
+
+        if not wav_files:
+            messagebox.showinfo("Export",
+                f"CSV lists {len(my_rows)} lines for \"{actor}\", "
+                f"but no WAV files were found on disk.")
+            return
+
+        # Sanitize actor name for filename
+        safe_name = "".join(
+            c if (c.isalnum() or c in "-_ ") else "_" for c in actor
+        ).strip().replace(" ", "_")
+        stamp = datetime.now().strftime("%Y%m%d")
+        default_name = f"PST_Voice_{safe_name}_{stamp}.zip"
+
+        # Ask where to save
+        save_path = filedialog.asksaveasfilename(
+            title="Export Voice Recordings",
+            defaultextension=".zip",
+            initialfile=default_name,
+            filetypes=[("ZIP archives", "*.zip")],
+            parent=self)
+
+        if not save_path:
+            return  # user cancelled
+
+        try:
+            with zipfile.ZipFile(save_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                # Write the CSV (full copy, renamed for the actor)
+                csv_name = f"unvoiced_dialog_{safe_name}.csv"
+                zf.writestr(csv_name, self._csv_to_string())
+
+                # Write the actor's WAV files
+                for src_path, arc_name in wav_files:
+                    zf.write(src_path, arc_name)
+
+            parts = [
+                f"Exported {len(wav_files)} recordings by {actor}",
+            ]
+            if missing:
+                parts.append(f"({missing} WAV files missing from disk, skipped)")
+            parts.append(f"\nSaved to:\n{Path(save_path).name}")
+
+            messagebox.showinfo("Export Complete", "\n".join(parts))
+
+        except Exception as exc:
+            messagebox.showerror("Export Error",
+                f"Could not create ZIP:\n\n{exc}")
+
+    def _csv_to_string(self) -> str:
+        """Serialize the master CSV rows to a string."""
+        import io
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS,
+                                extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(self.all_rows)
+        return buf.getvalue()
+
+    # -----------------------------------------------------------------------
+    # Template
+    # -----------------------------------------------------------------------
+    def _create_template(self):
+        """Create a portable Voice Booth package for a character or area."""
+        if self.is_recording:
+            messagebox.showwarning("Template",
+                "Cannot create template while recording.")
+            return
+
+        area = self._strip_check(self.area_var.get())
+        char = self._strip_check(self.char_var.get())
+        has_area = area != "All Areas"
+        has_char = char != "All Characters" and char in self.all_characters
+
+        if not has_area and not has_char:
+            messagebox.showwarning("Template",
+                "Select a character or area in the filter first.\n\n"
+                "\u2022 Character selected \u2192 template for that character\n"
+                "\u2022 Area selected \u2192 template for that whole area\n"
+                "\u2022 Both selected \u2192 template for that character in that area")
+            return
+
+        # Determine what to include and how to name it
+        if has_char:
+            # Character takes priority — grab ALL their lines across areas
+            label = char
+            template_rows = [r for r in self.all_rows
+                             if r["character"] == char]
+        else:
+            # Area only — grab all lines in that area
+            label = area
+            template_rows = [r for r in self.all_rows
+                             if r["area"] == area]
+
+        if not template_rows:
+            messagebox.showinfo("Template",
+                f"No lines found for \"{label}\".")
+            return
+
+        # Deep copy and strip voice_file/voice_actor for a clean slate
+        clean_rows = []
+        for r in template_rows:
+            clean = dict(r)
+            clean["voice_file"] = ""
+            clean["voice_actor"] = ""
+            clean_rows.append(clean)
+
+        # Sanitize label for filename
+        safe_name = "".join(
+            c if (c.isalnum() or c in "-_ ") else "_" for c in label
+        ).strip().replace(" ", "_")
+        default_name = f"PSTVB_{safe_name}.zip"
+
+        # Ask where to save
+        save_path = filedialog.asksaveasfilename(
+            title="Save Voice Booth Template",
+            defaultextension=".zip",
+            initialfile=default_name,
+            filetypes=[("ZIP archives", "*.zip")],
+            parent=self)
+
+        if not save_path:
+            return  # user cancelled
+
+        try:
+            with zipfile.ZipFile(save_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                # Include voice_booth.py
+                script_path = Path(__file__).resolve()
+                zf.write(script_path, "voice_booth.py")
+
+                # Build filtered CSV
+                import io
+                buf = io.StringIO()
+                writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS,
+                                        extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(clean_rows)
+                zf.writestr("unvoiced_dialog.csv", buf.getvalue())
+
+            chars_in_template = sorted({r["character"] for r in clean_rows})
+            messagebox.showinfo("Template Created",
+                f"Created template for: {label}\n\n"
+                f"Lines: {len(clean_rows)}\n"
+                f"Characters: {', '.join(chars_in_template[:8])}"
+                f"{'...' if len(chars_in_template) > 8 else ''}\n\n"
+                f"Saved to:\n{Path(save_path).name}\n\n"
+                f"Send this zip to a voice actor. They extract it,\n"
+                f"run voice_booth.py, record, then hit Export.")
+
+        except Exception as exc:
+            messagebox.showerror("Template Error",
+                f"Could not create template:\n\n{exc}")
 
     # -----------------------------------------------------------------------
     # Misc
